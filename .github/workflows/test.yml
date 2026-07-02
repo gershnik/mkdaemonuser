@@ -2,11 +2,13 @@ name: Test
 
 on:
   push:
-  pull_request:
+    paths-ignore:
+      - 'README.md'
+      - 'LICENSE'
   workflow_dispatch:
 
 jobs:
-  test:
+  main:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -22,3 +24,32 @@ jobs:
       # older /usr/bin/python3), so pass the resolved interpreter explicitly.
       - name: Run tests
         run: sudo "$(which python3)" test/test.py
+
+  others:
+    concurrency: ${{ matrix.remote_host }}
+    runs-on: [self-hosted, server]
+    strategy:
+      fail-fast: false
+      matrix:
+        remote_host: 
+          - alpine-3
+          - freebsd-15
+          - openbsd-7-5
+          - netbsd-10
+          - dragonfly
+          - omnios
+          - haiku
+    steps:
+    - name: Run remote build
+      run: |
+        "$RUNNER_TOOLS_PATH"/run-agent gh-${{ matrix.remote_host }} <<'EOF'
+        set -e
+        if [ ! -d work/mkdaemonuser ]; then
+          git clone https://github.com/gershnik/mkdaemonuser.git work/mkdaemonuser
+        fi
+        cd work/mkdaemonuser
+        git fetch --all
+        git fetch -f --prune --tags
+        git reset --hard ${{ github.sha }}
+        sudo test/test.py
+        EOF
