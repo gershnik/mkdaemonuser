@@ -512,6 +512,12 @@ def _create_daemon_user_via_commands(
     elif system == "Linux" and alpine and adduser and addgroup:
         _run([addgroup, "-S", name])
         _run([adduser, "-S", "-D", "-H", "-G", name, "-h", home_directory, "-s", shell or "/sbin/nologin", "-g", full_name, name])
+        # without this the group entry in the /etc/group does not point back to the user, which
+        # apparently is the needed thing on Alpine because a) many daemon accounts do it and b) without
+        # it the `deluser foo` command reports "deluser: can't find foo in /etc/group"
+        # The flip side is that `id foo` will report double group membership but this holds
+        # for many other daemons accounts too
+        _run([addgroup, name, name])
     elif system == "OpenBSD" and useradd:
         _run([useradd, "-L", "daemon", "-g", "=uid", "-d", home_directory, "-s", shell or "/sbin/nologin", "-c", full_name, name])
     elif system == "NetBSD" and useradd:
