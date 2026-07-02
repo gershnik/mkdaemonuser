@@ -261,7 +261,7 @@ def main() -> int:
     if not SCRIPT.exists():
         print(f"cannot find script under test: {SCRIPT}", file=sys.stderr)
         return 2
-    if os.geteuid() != 0:
+    if platform.system() != "Haiku" and os.geteuid() != 0:
         print("these tests create and delete real accounts; run as root (e.g. sudo).",
               file=sys.stderr)
         return 2
