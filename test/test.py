@@ -57,13 +57,10 @@ def _sh(prog: str, *args: str) -> None:
         subprocess.run([resolved, *args], capture_output=True, text=True, check=False)
 
 
-def _is_alpine() -> bool:
-    """Return True on Alpine Linux (BusyBox deluser/delgroup for cleanup)."""
-    try:
-        contents = Path("/etc/os-release").read_text(encoding="utf-8")
-    except OSError:
-        return False
-    return any(line.strip() == "ID=alpine" for line in contents.splitlines())
+def _is_busybox(name: str) -> bool:
+    """Return True if `name` resolves to the BusyBox multi-call binary."""
+    path = _which(name)
+    return path is not None and Path(path).resolve().name == "busybox"
 
 
 def unique_name() -> str:
@@ -109,14 +106,14 @@ def delete_account(name: str) -> None:
     if system == "Darwin":
         _sh("dscl", ".", "-delete", f"/Users/{name}")
         _sh("dscl", ".", "-delete", f"/Groups/{name}")
-    elif system == "Linux" and _is_alpine():
+    elif system == "Linux" and not _which("userdel") and _is_busybox("deluser"):
         _sh("deluser", name)
         _sh("delgroup", name)
     elif system in ("FreeBSD", "DragonFly"):
         _sh("pw", "userdel", name)
         _sh("pw", "groupdel", name)
     else:
-        # Linux (non-Alpine), OpenBSD, NetBSD, SunOS, Haiku, and fallback.
+        # Linux (non-BusyBox), OpenBSD, NetBSD, SunOS, Haiku, and fallback.
         _sh("userdel", name)
         _sh("groupdel", name)
 
