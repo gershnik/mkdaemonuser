@@ -485,7 +485,7 @@ def _find_program(name: str, directories: tuple[str, ...]) -> str | None:
 
 def _run(cmd: list[str]) -> None:
     """Run a command, ignoring its exit status (success is verified afterwards)."""
-    subprocess.run(cmd, check=False, capture_output=True, text=True)
+    subprocess.run(cmd, check=False)
 
 
 def _create_daemon_user_via_commands(
