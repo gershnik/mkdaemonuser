@@ -579,25 +579,46 @@ def create_daemon_user(
     return _create_daemon_user_via_commands(name, full_name, home_directory, shell)
 
 
+def _nonempty(value: str) -> str:
+    """argparse type: reject an empty or all-whitespace value."""
+    if not value.strip():
+        raise argparse.ArgumentTypeError("must not be empty or whitespace")
+    return value
+
+
+def _absolute_path(value: str) -> str:
+    """argparse type: reject an empty value and require an absolute path."""
+    value = _nonempty(value)
+    if not value.startswith("/"):
+        raise argparse.ArgumentTypeError("must be an absolute path (start with '/')")
+    return value
+
+
 def main(argv: list[str] | None = None) -> int:
     """main entry point"""
     parser = argparse.ArgumentParser(
         description="Create a daemon user and a matching group.",
     )
-    parser.add_argument("login", help="name for both the user and the group")
+    parser.add_argument("login", type=_nonempty, help="name for both the user and the group")
     parser.add_argument(
-        "-c", "--comment", dest="full_name", required=True,
+        "-c", "--comment", dest="full_name", type=_nonempty, required=True,
         help="full name (GECOS); applied to both the user and the group",
     )
     parser.add_argument(
-        "-d", "--home-dir", dest="home_directory", required=True,
+        "-d", "--home-dir", dest="home_directory", type=_absolute_path, required=True,
         help="home directory for the account",
     )
     parser.add_argument(
-        "-s", "--shell", default=None,
+        "-s", "--shell", type=_absolute_path, default=None,
         help="login shell (default: a platform-appropriate locked shell)",
     )
     args = parser.parse_args(argv)
+
+    if args.shell is not None:
+        shell_path = Path(args.shell)
+        if not (shell_path.is_file() and os.access(shell_path, os.X_OK)):
+            print(f"{parser.prog}: warning: shell {args.shell!r} does not exist or is not executable",
+                  file=sys.stderr)
 
     try:
         if os.geteuid() != 0:

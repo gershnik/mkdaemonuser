@@ -164,6 +164,7 @@ def test_explicit_shell(home: str) -> None:
     try:
         result = run_tool(name, "-c", "Test", "-d", home, "-s", shell)
         assert result.returncode == 0, f"exit={result.returncode} stderr={result.stderr!r}"
+        assert "warning" not in result.stderr, f"unexpected warning: {result.stderr!r}"
         user = get_pw(name)
         assert user.pw_shell == shell, f"shell {user.pw_shell!r} != {shell!r}"
     finally:
@@ -202,6 +203,45 @@ def test_missing_required_argument(home: str) -> None:
         delete_account(name)  # belt and suspenders
 
 
+def test_rejects_invalid_arguments(home: str) -> None:
+    """Empty/whitespace values and relative paths are usage errors (exit 2)."""
+    good = unique_name()
+    cases = [
+        (["", "-c", "Test", "-d", home], "empty or whitespace"),                  # empty login
+        ([good, "-c", "   ", "-d", home], "empty or whitespace"),                 # whitespace comment
+        ([good, "-c", "Test", "-d", "relative/dir"], "absolute path"),            # relative home
+        ([good, "-c", "Test", "-d", home, "-s", "bin/false"], "absolute path"),   # relative shell
+    ]
+    try:
+        for argv, needle in cases:
+            result = run_tool(*argv)
+            assert result.returncode == 2, \
+                f"{argv}: expected exit 2, got {result.returncode} (stderr={result.stderr!r})"
+            assert needle in result.stderr, f"{argv}: {needle!r} not in {result.stderr!r}"
+        # Rejected arguments must never create anything.
+        try:
+            pwd.getpwnam(good)
+            raise AssertionError(f"account {good!r} was unexpectedly created")
+        except KeyError:
+            pass
+    finally:
+        delete_account(good)  # belt and suspenders
+
+
+def test_warns_on_missing_shell(home: str) -> None:
+    """An absolute but non-existent shell warns yet still creates the account."""
+    name = unique_name()
+    missing_shell = "/opt/does/not/exist/nologin"
+    try:
+        result = run_tool(name, "-c", "Test", "-d", home, "-s", missing_shell)
+        assert result.returncode == 0, f"exit={result.returncode} stderr={result.stderr!r}"
+        assert "warning" in result.stderr, f"expected a warning, stderr={result.stderr!r}"
+        user = get_pw(name)
+        assert user.pw_shell == missing_shell, f"shell {user.pw_shell!r} != {missing_shell!r}"
+    finally:
+        delete_account(name)
+
+
 # --------------------------------------------------------------------------- #
 # Runner
 # --------------------------------------------------------------------------- #
@@ -211,8 +251,9 @@ TESTS = [
     test_explicit_shell,
     test_already_exists,
     test_missing_required_argument,
+    test_rejects_invalid_arguments,
+    test_warns_on_missing_shell,
 ]
-
 
 def main() -> int:
     """Run all tests, returning a process exit status (0 = all passed)."""
