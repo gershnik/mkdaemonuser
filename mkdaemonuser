@@ -511,9 +511,7 @@ def _create_daemon_user_via_commands(
         _run([useradd, "-r", "-d", home_directory, "-s", shell or "/bin/false", "-c", full_name, name])
     elif system == "Linux" and alpine and adduser and addgroup:
         _run([addgroup, "-S", name])
-        _run([adduser, "-S", "-D", "-H", "-h", home_directory, "-s", shell or "/sbin/nologin", "-g", full_name, name])
-        # A second addgroup puts the user in its group; adduser's -G is unreliable here.
-        _run([addgroup, name, name])
+        _run([adduser, "-S", "-D", "-H", "-G", name, "-h", home_directory, "-s", shell or "/sbin/nologin", "-g", full_name, name])
     elif system == "OpenBSD" and useradd:
         _run([useradd, "-L", "daemon", "-g", "=uid", "-d", home_directory, "-s", shell or "/sbin/nologin", "-c", full_name, name])
     elif system == "NetBSD" and useradd:
