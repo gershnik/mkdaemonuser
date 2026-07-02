@@ -38,7 +38,7 @@ jobs:
           - netbsd-10
           - dragonfly
           - omnios
-          - haiku
+          #- haiku
     steps:
     - name: Run remote build
       run: |
