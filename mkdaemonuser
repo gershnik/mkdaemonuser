@@ -22,6 +22,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+VERSION = "0.1+dev"
+
 
 class DaemonUserError(Exception):
     """The request cannot be fulfilled for an explainable, expected reason.
@@ -607,6 +609,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Create a daemon user and a matching group.",
     )
+    parser.add_argument("--version", action="version", version=f"{VERSION}")
     parser.add_argument("login", type=_nonempty, help="name for both the user and the group")
     parser.add_argument(
         "-c", "--comment", dest="full_name", type=_nonempty, required=True,

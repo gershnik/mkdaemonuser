@@ -1,0 +1,49 @@
+#! /usr/bin/env python3
+
+# pylint: disable=line-too-long, invalid-name
+
+"""Create a new release for this repo"""
+
+import sys
+import re
+import subprocess
+
+from pathlib import Path
+from datetime import date
+
+MYPATH = Path(__file__).parent
+ROOT = MYPATH.parent
+
+NEW_VER = sys.argv[1]
+
+unreleased_link_pattern = re.compile(r"^\[Unreleased\]: (.*)$", re.DOTALL)
+lines = []
+with open(ROOT / "CHANGELOG.md", "rt", encoding='utf-8') as change_log:
+    for line in change_log.readlines():
+        # Move Unreleased section to new version
+        if re.fullmatch(r"^## Unreleased.*$", line, re.DOTALL):
+            lines.append(line)
+            lines.append("\n")
+            lines.append(
+                f"## [{NEW_VER}] - {date.today().isoformat()}\n"
+            )
+        else:
+            lines.append(line)
+    lines.append(f'[{NEW_VER}]: https://github.com/gershnik/mkdaemonuser/releases/v{NEW_VER}\n')
+
+with open(ROOT / "CHANGELOG.md", "wt", encoding='utf-8') as change_log:
+    change_log.writelines(lines)
+
+text = (ROOT / "mkdaemonuser").read_text(encoding='utf-8')
+text = re.sub(r'^(VERSION\s*=\s*)"[^"]+"', rf'\1"{NEW_VER}"', text, flags=re.MULTILINE)
+(ROOT / "mkdaemonuser").write_text(text, encoding='utf-8')
+
+subprocess.run(['git', 'add', ROOT / "CHANGELOG.md", ROOT / "mkdaemonuser"], check=True)
+subprocess.run(['git', 'commit', '-m', f'chore: creating version {NEW_VER}'], check=True)
+subprocess.run(['git', 'tag', f'v{NEW_VER}'], check=True)
+
+text = (ROOT / "mkdaemonuser").read_text(encoding='utf-8')
+text = re.sub(r'^(VERSION\s*=\s*)"[^"]+"', rf'\1"{NEW_VER}+dev"', text, flags=re.MULTILINE)
+(ROOT / "mkdaemonuser").write_text(text)
+subprocess.run(['git', 'add', ROOT / "mkdaemonuser"], check=True)
+subprocess.run(['git', 'commit', '-m', 'chore: bumping dev version'], check=True)

@@ -23,7 +23,7 @@ on all these platforms.
 If you have curl:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/gershnik/mkdaemonuser/master/mkdaemonuser | \
+curl -fsSL https://github.com/gershnik/mkdaemonuser/releases/latest/download/mkdaemonuser | \
     sudo tee /usr/local/bin/mkdaemonuser >/dev/null && \
     sudo chmod a+x /usr/local/bin/mkdaemonuser
 ```
@@ -31,7 +31,7 @@ curl -fsSL https://raw.githubusercontent.com/gershnik/mkdaemonuser/master/mkdaem
 Or, if you prefer wget:
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/gershnik/mkdaemonuser/master/mkdaemonuser | \
+wget -qO- https://github.com/gershnik/mkdaemonuser/releases/latest/download/mkdaemonuser | \
     sudo tee /usr/local/bin/mkdaemonuser >/dev/null && \
     sudo chmod a+x /usr/local/bin/mkdaemonuser
 ```
