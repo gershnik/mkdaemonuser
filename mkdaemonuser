@@ -514,8 +514,10 @@ def _create_daemon_user_via_commands(
         _run([adduser, "-S", "-D", "-H", "-h", home_directory, "-s", shell or "/sbin/nologin", "-g", full_name, name])
         # A second addgroup puts the user in its group; adduser's -G is unreliable here.
         _run([addgroup, name, name])
-    elif system in ("OpenBSD", "NetBSD") and useradd:
+    elif system == "OpenBSD" and useradd:
         _run([useradd, "-L", "daemon", "-g", "=uid", "-d", home_directory, "-s", shell or "/sbin/nologin", "-c", full_name, name])
+    elif system == "NetBSD" and useradd:
+        _run([useradd, "-g", "=uid", "-d", home_directory, "-s", shell or "/sbin/nologin", "-c", full_name, name])
     elif system == "Haiku" and useradd and groupadd:
         _run([groupadd, name])
         _run([useradd, "-g", name, "-d", home_directory, "-s", shell or "/bin/false", "-n", full_name, name])
