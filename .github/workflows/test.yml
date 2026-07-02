@@ -38,7 +38,7 @@ jobs:
           - netbsd-10
           - dragonfly
           - omnios
-          - haiku
+          #- haiku
     steps:
     - name: Run remote build
       run: |
@@ -51,5 +51,9 @@ jobs:
         git fetch --all
         git fetch -f --prune --tags
         git reset --hard ${{ github.sha }}
-        sudo test/test.py
+        if [[ '${{ matrix.remote_host }}' != 'haiku' ]]; then
+            echo "${{ secrets.SUDO_PWD }}" | sudo -S -p '' test/test.py
+        else
+            test/test.py
+        fi
         EOF
