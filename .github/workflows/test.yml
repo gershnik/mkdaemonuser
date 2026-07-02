@@ -38,7 +38,7 @@ jobs:
           - netbsd-10
           - dragonfly
           - omnios
-          #- haiku
+          - haiku
     steps:
     - name: Run remote build
       run: |
@@ -54,6 +54,6 @@ jobs:
         if [[ '${{ matrix.remote_host }}' != 'haiku' ]]; then
             echo "${{ secrets.SUDO_PWD }}" | sudo -S -p '' test/test.py
         else
-            test/test.py
+            tsudo "${{ secrets.SUDO_PWD }}" test/test.py
         fi
         EOF
