@@ -5,6 +5,7 @@ on:
     paths-ignore:
       - 'README.md'
       - 'LICENSE'
+      - '.github/workflows/publish.yml'
   workflow_dispatch:
 
 jobs:
@@ -17,7 +18,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # The tests create and delete real accounts, so they must run as root.
       # sudo resets PATH to a secure default (which on macOS can point at an
