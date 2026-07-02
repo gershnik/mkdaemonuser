@@ -623,7 +623,7 @@ def main(argv: list[str] | None = None) -> int:
                   file=sys.stderr)
 
     try:
-        if platform.system() != "Haiku" and os.geteuid() != 0:
+        if os.geteuid() != 0:
             raise DaemonUserError("must be run as root (creates a local account)")
         existing = _existing_kind(args.login)
         if existing:
