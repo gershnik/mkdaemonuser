@@ -560,7 +560,7 @@ def create_daemon_user(
     home_directory: str,
     shell: str | None = None,
 ) -> tuple[int, int]:
-    """Create the hidden daemon group + user and return (uid, gid).
+    """Create the daemon group + user and return (uid, gid).
 
     `full_name` is applied to both the user and the group; `full_name` and
     `home_directory` are mandatory. When `shell` is None a platform-appropriate
@@ -579,9 +579,9 @@ def create_daemon_user(
 def main(argv: list[str] | None = None) -> int:
     """main entry point"""
     parser = argparse.ArgumentParser(
-        description="Create a hidden daemon user and a matching group.",
+        description="Create a daemon user and a matching group.",
     )
-    parser.add_argument("login", help="record name for both the user and the group")
+    parser.add_argument("login", help="name for both the user and the group")
     parser.add_argument(
         "-c", "--comment", dest="full_name", required=True,
         help="full name (GECOS); applied to both the user and the group",
