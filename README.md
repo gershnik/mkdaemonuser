@@ -16,7 +16,7 @@ on all these platforms.
 ## Prerequisites
 
 * Python 3.10 or above.
-* macOS, Linux, {Free|Net|Open|DragonFly}BSD or Haiku.
+* macOS, Linux, {Free|Net|Open|DragonFly}BSD, illumos or Haiku.
 
 ## Installation
 
