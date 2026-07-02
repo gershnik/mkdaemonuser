@@ -1,425 +1,534 @@
 #! /usr/bin/env python3
 
-"""Create a hidden macOS "daemon" user + group by calling the OpenDirectory C
-API directly through ctypes (standard library only).
-Requires root: writing to the local directory node is privileged.
+"""Create a "daemon" user + group.
+
+On macOS the account is created through the OpenDirectory C API (via ctypes,
+standard library only). On other Unix systems it is created by invoking the
+platform's user-management tools (useradd/groupadd, pw, or BusyBox
+adduser/addgroup). Requires root on every platform.
 """
 
 # pylint: disable=line-too-long, invalid-name
 
 import argparse
-import ctypes
 import grp
 import os
+import platform
 import pwd
+import subprocess
 import sys
-from ctypes import POINTER, byref, c_bool, c_char_p, c_long, c_ulong, c_uint32, c_void_p
+from pathlib import Path
 
 
 class DaemonUserError(Exception):
     """The request cannot be fulfilled for an explainable, expected reason.
 
-    Distinct from bugs or OpenDirectory failures: these represent conditions the
-    caller can understand and act on (e.g. not running as root, or no free ID in
-    the allotted range). main() reports the message and exits non-zero without a
-    traceback.
+    Distinct from bugs or platform failures: these represent conditions the
+    caller can understand and act on (e.g. not running as root, no free ID in
+    the allotted range, a missing tool, or an unsupported platform). main()
+    reports the message and exits non-zero without a traceback.
     """
 
-# --------------------------------------------------------------------------- #
-# Framework loading
-# --------------------------------------------------------------------------- #
-
-_CF_PATH = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
-_OD_PATH = "/System/Library/Frameworks/OpenDirectory.framework/OpenDirectory"
-_CFOD_PATH = (
-    "/System/Library/Frameworks/OpenDirectory.framework"
-    "/Frameworks/CFOpenDirectory.framework/CFOpenDirectory"
-)
-
-cf = ctypes.CDLL(_CF_PATH, use_errno=True)
-od = ctypes.CDLL(_OD_PATH, use_errno=True)
-try:
-    # The OD C functions/constants physically live in the CFOpenDirectory
-    # sub-framework; the umbrella usually re-exports them, but bind explicitly.
-    cfod = ctypes.CDLL(_CFOD_PATH, use_errno=True)
-except OSError:
-    cfod = od
-
-
-def _fn(name, restype, argtypes):
-    """Bind a C function from whichever OD handle exposes it."""
-    for lib in (cfod, od):
-        try:
-            f = getattr(lib, name)
-        except AttributeError:
-            continue
-        f.restype = restype
-        f.argtypes = argtypes
-        return f
-    raise OSError(f"OpenDirectory symbol not found: {name}")
-
-
-def _const_ptr(name: str) -> int:
-    """Read an exported CFStringRef/pointer constant from the OD frameworks."""
-    for lib in (cfod, od):
-        try:
-            value = c_void_p.in_dll(lib, name).value
-        except ValueError:
-            continue
-        if value is None:
-            raise OSError(f"OpenDirectory constant {name!r} resolved to NULL")
-        return value
-    raise OSError(f"OpenDirectory constant not found: {name}")
-
-
-def _sym_addr(lib, name):
-    """Address of an exported data symbol (e.g. a CF callbacks struct)."""
-    return ctypes.addressof(ctypes.c_char.in_dll(lib, name))
-
 
 # --------------------------------------------------------------------------- #
-# CoreFoundation prototypes
+# macOS: OpenDirectory implementation
+#
+# Everything ctypes/OpenDirectory lives under this guard so the module imports
+# cleanly on platforms where the frameworks do not exist.
 # --------------------------------------------------------------------------- #
 
-CFRelease = cf.CFRelease
-CFRelease.restype = None
-CFRelease.argtypes = [c_void_p]
+if sys.platform == "darwin":
 
-CFStringCreateWithCString = cf.CFStringCreateWithCString
-CFStringCreateWithCString.restype = c_void_p
-CFStringCreateWithCString.argtypes = [c_void_p, c_char_p, c_uint32]
+    import ctypes
+    from ctypes import POINTER, byref, c_bool, c_char_p, c_long, c_ulong, c_uint32, c_void_p
 
-CFStringGetLength = cf.CFStringGetLength
-CFStringGetLength.restype = c_long
-CFStringGetLength.argtypes = [c_void_p]
+    _CF_PATH = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+    _OD_PATH = "/System/Library/Frameworks/OpenDirectory.framework/OpenDirectory"
+    _CFOD_PATH = (
+        "/System/Library/Frameworks/OpenDirectory.framework"
+        "/Frameworks/CFOpenDirectory.framework/CFOpenDirectory"
+    )
 
-CFStringGetMaximumSizeForEncoding = cf.CFStringGetMaximumSizeForEncoding
-CFStringGetMaximumSizeForEncoding.restype = c_long
-CFStringGetMaximumSizeForEncoding.argtypes = [c_long, c_uint32]
-
-CFStringGetCString = cf.CFStringGetCString
-CFStringGetCString.restype = c_bool
-CFStringGetCString.argtypes = [c_void_p, c_char_p, c_long, c_uint32]
-
-CFArrayCreate = cf.CFArrayCreate
-CFArrayCreate.restype = c_void_p
-CFArrayCreate.argtypes = [c_void_p, POINTER(c_void_p), c_long, c_void_p]
-
-CFArrayGetCount = cf.CFArrayGetCount
-CFArrayGetCount.restype = c_long
-CFArrayGetCount.argtypes = [c_void_p]
-
-CFArrayGetValueAtIndex = cf.CFArrayGetValueAtIndex
-CFArrayGetValueAtIndex.restype = c_void_p
-CFArrayGetValueAtIndex.argtypes = [c_void_p, c_long]
-
-CFDictionaryCreate = cf.CFDictionaryCreate
-CFDictionaryCreate.restype = c_void_p
-CFDictionaryCreate.argtypes = [c_void_p, POINTER(c_void_p), POINTER(c_void_p), c_long, c_void_p, c_void_p]
-
-CFGetTypeID = cf.CFGetTypeID
-CFGetTypeID.restype = c_ulong
-CFGetTypeID.argtypes = [c_void_p]
-
-CFStringGetTypeID = cf.CFStringGetTypeID
-CFStringGetTypeID.restype = c_ulong
-CFStringGetTypeID.argtypes = []
-
-CFErrorCopyDescription = cf.CFErrorCopyDescription
-CFErrorCopyDescription.restype = c_void_p
-CFErrorCopyDescription.argtypes = [c_void_p]
-
-CFErrorGetCode = cf.CFErrorGetCode
-CFErrorGetCode.restype = c_long
-CFErrorGetCode.argtypes = [c_void_p]
-
-CFErrorGetDomain = cf.CFErrorGetDomain
-CFErrorGetDomain.restype = c_void_p
-CFErrorGetDomain.argtypes = [c_void_p]
-
-_ARRAY_CB = _sym_addr(cf, "kCFTypeArrayCallBacks")
-_DICT_KEY_CB = _sym_addr(cf, "kCFTypeDictionaryKeyCallBacks")
-_DICT_VAL_CB = _sym_addr(cf, "kCFTypeDictionaryValueCallBacks")
-
-kCFStringEncodingUTF8 = 0x08000100
-
-# --------------------------------------------------------------------------- #
-# OpenDirectory prototypes
-# --------------------------------------------------------------------------- #
-
-ODNodeCreateWithNodeType = _fn(
-    "ODNodeCreateWithNodeType", c_void_p, [c_void_p, c_void_p, c_long, POINTER(c_void_p)]
-)
-ODNodeCopyRecord = _fn(
-    "ODNodeCopyRecord", c_void_p, [c_void_p, c_void_p, c_void_p, c_void_p, POINTER(c_void_p)]
-)
-ODNodeCreateRecord = _fn(
-    "ODNodeCreateRecord", c_void_p, [c_void_p, c_void_p, c_void_p, c_void_p, POINTER(c_void_p)]
-)
-ODRecordSetValue = _fn(
-    "ODRecordSetValue", c_bool, [c_void_p, c_void_p, c_void_p, POINTER(c_void_p)]
-)
-ODRecordCopyValues = _fn(
-    "ODRecordCopyValues", c_void_p, [c_void_p, c_void_p, POINTER(c_void_p)]
-)
-ODRecordSynchronize = _fn(
-    "ODRecordSynchronize", c_bool, [c_void_p, POINTER(c_void_p)]
-)
-ODQueryCreateWithNode = _fn(
-    "ODQueryCreateWithNode",
-    c_void_p,
-    [c_void_p, c_void_p, c_void_p, c_void_p, c_long, c_void_p, c_void_p, c_long, POINTER(c_void_p)],
-)
-ODQueryCopyResults = _fn(
-    "ODQueryCopyResults", c_void_p, [c_void_p, c_bool, POINTER(c_void_p)]
-)
-
-# Numeric enum constants (compile-time in the headers, so hardcoded here).
-kODNodeTypeLocalNodes = 0x2200
-kODMatchEqualTo = 0x2001
-kODErrorRecordAlreadyExists = 4102  # verified against <OpenDirectory/OpenDirectory.h>
-CFINDEX_MAX = 0x7FFFFFFFFFFFFFFF
-
-# CFStringRef / pointer constants (resolved from the framework symbol table).
-kODRecordTypeUsers = _const_ptr("kODRecordTypeUsers")
-kODRecordTypeGroups = _const_ptr("kODRecordTypeGroups")
-kODAttributeTypeUniqueID = _const_ptr("kODAttributeTypeUniqueID")
-kODAttributeTypePrimaryGroupID = _const_ptr("kODAttributeTypePrimaryGroupID")
-kODAttributeTypeUserShell = _const_ptr("kODAttributeTypeUserShell")
-kODAttributeTypePassword = _const_ptr("kODAttributeTypePassword")
-kODAttributeTypeNFSHomeDirectory = _const_ptr("kODAttributeTypeNFSHomeDirectory")
-kODAttributeTypeFullName = _const_ptr("kODAttributeTypeFullName")
-kODAttributeTypeAllAttributes = _const_ptr("kODAttributeTypeAllAttributes")
-_kODErrorDomainFramework = _const_ptr("kODErrorDomainFramework")
-
-# The default session is NULL: passing NULL to ODNodeCreateWithNodeType selects
-# it. So there's nothing to look up (and no error to swallow) here.
-kODSessionDefault = None
-
-# Defaults.
-DEFAULT_SHELL = "/usr/bin/false"
-DEFAULT_PASSWORD = "*"  # disables password login
-ID_RANGE = (501, 699)
-
-
-# --------------------------------------------------------------------------- #
-# CoreFoundation helpers
-# --------------------------------------------------------------------------- #
-
-def _cfstr(s: str) -> int:
-    """Create an owned CFString from a Python str (caller must CFRelease)."""
-    ref = CFStringCreateWithCString(None, s.encode("utf-8"), kCFStringEncodingUTF8)
-    if not ref:
-        raise RuntimeError("CFStringCreateWithCString failed")
-    return ref
-
-
-def _pystr(cfstring: int | None) -> str:
-    if not cfstring:
-        return ""
-    length = CFStringGetLength(cfstring)
-    maxsize = CFStringGetMaximumSizeForEncoding(length, kCFStringEncodingUTF8) + 1
-    buf = ctypes.create_string_buffer(maxsize)
-    if not CFStringGetCString(cfstring, buf, maxsize, kCFStringEncodingUTF8):
-        raise RuntimeError("CFStringGetCString failed")
-    return buf.value.decode("utf-8")
-
-
-def _cfarray(item_ptrs: list[int]) -> int:
-    """Create an owned CFArray of CF objects (kCFType retain/release callbacks)."""
-    n = len(item_ptrs)
-    if n == 0:
-        ref = CFArrayCreate(None, None, 0, _ARRAY_CB)
-    else:
-        values = (c_void_p * n)(*(c_void_p(p) for p in item_ptrs))
-        ref = CFArrayCreate(None, values, n, _ARRAY_CB)
-    if not ref:
-        raise RuntimeError("CFArrayCreate failed")
-    return ref
-
-
-def _cfdict(pairs: list[tuple[int, int]]) -> int:
-    n = len(pairs)
-    keys = (c_void_p * n)(*(c_void_p(k) for k, _ in pairs))
-    vals = (c_void_p * n)(*(c_void_p(v) for _, v in pairs))
-    ref = CFDictionaryCreate(None, keys, vals, n, _DICT_KEY_CB, _DICT_VAL_CB)
-    if not ref:
-        raise RuntimeError("CFDictionaryCreate failed")
-    return ref
-
-
-def _new_err() -> ctypes.c_void_p:
-    return c_void_p()
-
-
-def _release_error(err: ctypes.c_void_p) -> None:
-    """Release a CFErrorRef out-param if one was produced, discarding it."""
-    handle = err.value
-    if handle:
-        CFRelease(handle)
-
-
-def _drain_error(err: ctypes.c_void_p) -> tuple[int | None, str]:
-    """Consume a CFErrorRef out-param, returning (code, domain) and releasing it."""
-    handle = err.value
-    if not handle:
-        return None, ""
-    code = CFErrorGetCode(handle)
-    domain = _pystr(CFErrorGetDomain(handle))  # domain is borrowed
-    CFRelease(handle)
-    return code, domain
-
-
-def _raise_cf_error(err: ctypes.c_void_p):
-    handle = err.value
-    if not handle:
-        raise RuntimeError("OpenDirectory call failed with no error object")
-    desc = CFErrorCopyDescription(handle)  # owned
+    cf = ctypes.CDLL(_CF_PATH, use_errno=True)
+    od = ctypes.CDLL(_OD_PATH, use_errno=True)
     try:
-        msg = _pystr(desc)
-    finally:
-        if desc:
-            CFRelease(desc)
-    code = CFErrorGetCode(handle)
-    CFRelease(handle)
-    raise RuntimeError(f"OpenDirectory error {code}: {msg}")
+        # The OD C functions/constants physically live in the CFOpenDirectory
+        # sub-framework; the umbrella usually re-exports them, but bind explicitly.
+        cfod = ctypes.CDLL(_CFOD_PATH, use_errno=True)
+    except OSError:
+        cfod = od
 
+    def _fn(name, restype, argtypes):
+        """Bind a C function from whichever OD handle exposes it."""
+        for lib in (cfod, od):
+            try:
+                f = getattr(lib, name)
+            except AttributeError:
+                continue
+            f.restype = restype
+            f.argtypes = argtypes
+            return f
+        raise OSError(f"OpenDirectory symbol not found: {name}")
 
-# --------------------------------------------------------------------------- #
-# OpenDirectory record helpers
-# --------------------------------------------------------------------------- #
+    def _const_ptr(name: str) -> int:
+        """Read an exported CFStringRef/pointer constant from the OD frameworks."""
+        for lib in (cfod, od):
+            try:
+                value = c_void_p.in_dll(lib, name).value
+            except ValueError:
+                continue
+            if value is None:
+                raise OSError(f"OpenDirectory constant {name!r} resolved to NULL")
+            return value
+        raise OSError(f"OpenDirectory constant not found: {name}")
 
-def _set_attr_strings(record: int, attribute: int, values: list[str]) -> None:
-    cfvals = [_cfstr(v) for v in values]
-    try:
-        arr = _cfarray(cfvals)
-        try:
-            err = _new_err()
-            if not ODRecordSetValue(record, attribute, arr, byref(err)):
-                _raise_cf_error(err)
-        finally:
-            CFRelease(arr)
-    finally:
-        for v in cfvals:
-            CFRelease(v)
+    def _sym_addr(lib, name):
+        """Address of an exported data symbol (e.g. a CF callbacks struct)."""
+        return ctypes.addressof(ctypes.c_char.in_dll(lib, name))
 
+    # CoreFoundation prototypes
+    CFRelease = cf.CFRelease
+    CFRelease.restype = None
+    CFRelease.argtypes = [c_void_p]
 
-def _synchronize(record: int) -> None:
-    err = _new_err()
-    if not ODRecordSynchronize(record, byref(err)):
-        _raise_cf_error(err)
+    CFStringCreateWithCString = cf.CFStringCreateWithCString
+    CFStringCreateWithCString.restype = c_void_p
+    CFStringCreateWithCString.argtypes = [c_void_p, c_char_p, c_uint32]
 
+    CFStringGetLength = cf.CFStringGetLength
+    CFStringGetLength.restype = c_long
+    CFStringGetLength.argtypes = [c_void_p]
 
-def _get_string_attribute(record: int, attribute: int) -> str | None:
-    """Read a single-valued string attribute from a record.
+    CFStringGetMaximumSizeForEncoding = cf.CFStringGetMaximumSizeForEncoding
+    CFStringGetMaximumSizeForEncoding.restype = c_long
+    CFStringGetMaximumSizeForEncoding.argtypes = [c_long, c_uint32]
 
-    Returns the string if the attribute holds exactly one string value, the
-    empty string if that one value is null, and None if the attribute is absent,
-    multi-valued, or not a string.
-    """
-    err = _new_err()
-    val_array = ODRecordCopyValues(record, attribute, byref(err))
-    if not val_array:
-        _release_error(err)
-        return None
-    try:
-        if CFArrayGetCount(val_array) != 1:
-            return None
-        value = CFArrayGetValueAtIndex(val_array, 0)  # borrowed
-        if not value:
+    CFStringGetCString = cf.CFStringGetCString
+    CFStringGetCString.restype = c_bool
+    CFStringGetCString.argtypes = [c_void_p, c_char_p, c_long, c_uint32]
+
+    CFArrayCreate = cf.CFArrayCreate
+    CFArrayCreate.restype = c_void_p
+    CFArrayCreate.argtypes = [c_void_p, POINTER(c_void_p), c_long, c_void_p]
+
+    CFArrayGetCount = cf.CFArrayGetCount
+    CFArrayGetCount.restype = c_long
+    CFArrayGetCount.argtypes = [c_void_p]
+
+    CFArrayGetValueAtIndex = cf.CFArrayGetValueAtIndex
+    CFArrayGetValueAtIndex.restype = c_void_p
+    CFArrayGetValueAtIndex.argtypes = [c_void_p, c_long]
+
+    CFDictionaryCreate = cf.CFDictionaryCreate
+    CFDictionaryCreate.restype = c_void_p
+    CFDictionaryCreate.argtypes = [c_void_p, POINTER(c_void_p), POINTER(c_void_p), c_long, c_void_p, c_void_p]
+
+    CFGetTypeID = cf.CFGetTypeID
+    CFGetTypeID.restype = c_ulong
+    CFGetTypeID.argtypes = [c_void_p]
+
+    CFStringGetTypeID = cf.CFStringGetTypeID
+    CFStringGetTypeID.restype = c_ulong
+    CFStringGetTypeID.argtypes = []
+
+    CFErrorCopyDescription = cf.CFErrorCopyDescription
+    CFErrorCopyDescription.restype = c_void_p
+    CFErrorCopyDescription.argtypes = [c_void_p]
+
+    CFErrorGetCode = cf.CFErrorGetCode
+    CFErrorGetCode.restype = c_long
+    CFErrorGetCode.argtypes = [c_void_p]
+
+    CFErrorGetDomain = cf.CFErrorGetDomain
+    CFErrorGetDomain.restype = c_void_p
+    CFErrorGetDomain.argtypes = [c_void_p]
+
+    _ARRAY_CB = _sym_addr(cf, "kCFTypeArrayCallBacks")
+    _DICT_KEY_CB = _sym_addr(cf, "kCFTypeDictionaryKeyCallBacks")
+    _DICT_VAL_CB = _sym_addr(cf, "kCFTypeDictionaryValueCallBacks")
+
+    kCFStringEncodingUTF8 = 0x08000100
+
+    # OpenDirectory prototypes
+    ODNodeCreateWithNodeType = _fn(
+        "ODNodeCreateWithNodeType", c_void_p, [c_void_p, c_void_p, c_long, POINTER(c_void_p)]
+    )
+    ODNodeCopyRecord = _fn(
+        "ODNodeCopyRecord", c_void_p, [c_void_p, c_void_p, c_void_p, c_void_p, POINTER(c_void_p)]
+    )
+    ODNodeCreateRecord = _fn(
+        "ODNodeCreateRecord", c_void_p, [c_void_p, c_void_p, c_void_p, c_void_p, POINTER(c_void_p)]
+    )
+    ODRecordSetValue = _fn(
+        "ODRecordSetValue", c_bool, [c_void_p, c_void_p, c_void_p, POINTER(c_void_p)]
+    )
+    ODRecordCopyValues = _fn(
+        "ODRecordCopyValues", c_void_p, [c_void_p, c_void_p, POINTER(c_void_p)]
+    )
+    ODRecordSynchronize = _fn(
+        "ODRecordSynchronize", c_bool, [c_void_p, POINTER(c_void_p)]
+    )
+    ODQueryCreateWithNode = _fn(
+        "ODQueryCreateWithNode",
+        c_void_p,
+        [c_void_p, c_void_p, c_void_p, c_void_p, c_long, c_void_p, c_void_p, c_long, POINTER(c_void_p)],
+    )
+    ODQueryCopyResults = _fn(
+        "ODQueryCopyResults", c_void_p, [c_void_p, c_bool, POINTER(c_void_p)]
+    )
+
+    # Numeric enum constants (compile-time in the headers, so hardcoded here).
+    kODNodeTypeLocalNodes = 0x2200
+    kODMatchEqualTo = 0x2001
+    kODErrorRecordAlreadyExists = 4102  # verified against <OpenDirectory/OpenDirectory.h>
+    CFINDEX_MAX = 0x7FFFFFFFFFFFFFFF
+    ID_RANGE = (501, 699)
+
+    # CFStringRef / pointer constants (resolved from the framework symbol table).
+    kODRecordTypeUsers = _const_ptr("kODRecordTypeUsers")
+    kODRecordTypeGroups = _const_ptr("kODRecordTypeGroups")
+    kODAttributeTypeUniqueID = _const_ptr("kODAttributeTypeUniqueID")
+    kODAttributeTypePrimaryGroupID = _const_ptr("kODAttributeTypePrimaryGroupID")
+    kODAttributeTypeUserShell = _const_ptr("kODAttributeTypeUserShell")
+    kODAttributeTypePassword = _const_ptr("kODAttributeTypePassword")
+    kODAttributeTypeNFSHomeDirectory = _const_ptr("kODAttributeTypeNFSHomeDirectory")
+    kODAttributeTypeFullName = _const_ptr("kODAttributeTypeFullName")
+    kODAttributeTypeAllAttributes = _const_ptr("kODAttributeTypeAllAttributes")
+    _kODErrorDomainFramework = _const_ptr("kODErrorDomainFramework")
+
+    # The default session is NULL: passing NULL to ODNodeCreateWithNodeType selects
+    # it. So there's nothing to look up (and no error to swallow) here.
+    kODSessionDefault = None
+
+    # ----------------------------------------------------------------------- #
+    # CoreFoundation helpers
+    # ----------------------------------------------------------------------- #
+
+    def _cfstr(s: str) -> int:
+        """Create an owned CFString from a Python str (caller must CFRelease)."""
+        ref = CFStringCreateWithCString(None, s.encode("utf-8"), kCFStringEncodingUTF8)
+        if not ref:
+            raise RuntimeError("CFStringCreateWithCString failed")
+        return ref
+
+    def _pystr(cfstring: int | None) -> str:
+        if not cfstring:
             return ""
-        if CFGetTypeID(value) != CFStringGetTypeID():
-            return None
-        return _pystr(value)
-    finally:
-        CFRelease(val_array)
+        length = CFStringGetLength(cfstring)
+        maxsize = CFStringGetMaximumSizeForEncoding(length, kCFStringEncodingUTF8) + 1
+        buf = ctypes.create_string_buffer(maxsize)
+        if not CFStringGetCString(cfstring, buf, maxsize, kCFStringEncodingUTF8):
+            raise RuntimeError("CFStringGetCString failed")
+        return buf.value.decode("utf-8")
 
+    def _cfarray(item_ptrs: list[int]) -> int:
+        """Create an owned CFArray of CF objects (kCFType retain/release callbacks)."""
+        n = len(item_ptrs)
+        if n == 0:
+            ref = CFArrayCreate(None, None, 0, _ARRAY_CB)
+        else:
+            values = (c_void_p * n)(*(c_void_p(p) for p in item_ptrs))
+            ref = CFArrayCreate(None, values, n, _ARRAY_CB)
+        if not ref:
+            raise RuntimeError("CFArrayCreate failed")
+        return ref
 
-def _get_available_id(node: int, record_type: int, attribute: int, id_range: tuple[int, int]) -> int:
-    lo, hi = id_range
-    assert hi >= lo
-    empty_attrs = _cfarray([])  # request no attributes back; we only count matches
-    try:
-        for id_value in range(lo, hi + 1):
-            str_id = _cfstr(str(id_value))
+    def _cfdict(pairs: list[tuple[int, int]]) -> int:
+        n = len(pairs)
+        keys = (c_void_p * n)(*(c_void_p(k) for k, _ in pairs))
+        vals = (c_void_p * n)(*(c_void_p(v) for _, v in pairs))
+        ref = CFDictionaryCreate(None, keys, vals, n, _DICT_KEY_CB, _DICT_VAL_CB)
+        if not ref:
+            raise RuntimeError("CFDictionaryCreate failed")
+        return ref
+
+    def _new_err() -> ctypes.c_void_p:
+        return c_void_p()
+
+    def _release_error(err: ctypes.c_void_p) -> None:
+        """Release a CFErrorRef out-param if one was produced, discarding it."""
+        handle = err.value
+        if handle:
+            CFRelease(handle)
+
+    def _drain_error(err: ctypes.c_void_p) -> tuple[int | None, str]:
+        """Consume a CFErrorRef out-param, returning (code, domain) and releasing it."""
+        handle = err.value
+        if not handle:
+            return None, ""
+        code = CFErrorGetCode(handle)
+        domain = _pystr(CFErrorGetDomain(handle))  # domain is borrowed
+        CFRelease(handle)
+        return code, domain
+
+    def _raise_cf_error(err: ctypes.c_void_p):
+        handle = err.value
+        if not handle:
+            raise RuntimeError("OpenDirectory call failed with no error object")
+        desc = CFErrorCopyDescription(handle)  # owned
+        try:
+            msg = _pystr(desc)
+        finally:
+            if desc:
+                CFRelease(desc)
+        code = CFErrorGetCode(handle)
+        CFRelease(handle)
+        raise RuntimeError(f"OpenDirectory error {code}: {msg}")
+
+    # ----------------------------------------------------------------------- #
+    # OpenDirectory record helpers
+    # ----------------------------------------------------------------------- #
+
+    def _set_attr_strings(record: int, attribute: int, values: list[str]) -> None:
+        cfvals = [_cfstr(v) for v in values]
+        try:
+            arr = _cfarray(cfvals)
             try:
                 err = _new_err()
-                query = ODQueryCreateWithNode(
-                    None, node, record_type, attribute, kODMatchEqualTo,
-                    str_id, empty_attrs, CFINDEX_MAX, byref(err),
-                )
-                if not query:
+                if not ODRecordSetValue(record, attribute, arr, byref(err)):
                     _raise_cf_error(err)
+            finally:
+                CFRelease(arr)
+        finally:
+            for v in cfvals:
+                CFRelease(v)
+
+    def _synchronize(record: int) -> None:
+        err = _new_err()
+        if not ODRecordSynchronize(record, byref(err)):
+            _raise_cf_error(err)
+
+    def _get_string_attribute(record: int, attribute: int) -> str | None:
+        """Read a single-valued string attribute from a record.
+
+        Returns the string if the attribute holds exactly one string value, the
+        empty string if that one value is null, and None if the attribute is
+        absent, multi-valued, or not a string.
+        """
+        err = _new_err()
+        val_array = ODRecordCopyValues(record, attribute, byref(err))
+        if not val_array:
+            _release_error(err)
+            return None
+        try:
+            if CFArrayGetCount(val_array) != 1:
+                return None
+            value = CFArrayGetValueAtIndex(val_array, 0)  # borrowed
+            if not value:
+                return ""
+            if CFGetTypeID(value) != CFStringGetTypeID():
+                return None
+            return _pystr(value)
+        finally:
+            CFRelease(val_array)
+
+    def _get_available_id(node: int, record_type: int, attribute: int, id_range: tuple[int, int]) -> int:
+        lo, hi = id_range
+        assert hi >= lo
+        empty_attrs = _cfarray([])  # request no attributes back; we only count matches
+        try:
+            for id_value in range(lo, hi + 1):
+                str_id = _cfstr(str(id_value))
                 try:
                     err = _new_err()
-                    results = ODQueryCopyResults(query, False, byref(err))
-                    if not results:
+                    query = ODQueryCreateWithNode(
+                        None, node, record_type, attribute, kODMatchEqualTo,
+                        str_id, empty_attrs, CFINDEX_MAX, byref(err),
+                    )
+                    if not query:
                         _raise_cf_error(err)
                     try:
-                        if CFArrayGetCount(results) == 0:
-                            return id_value
+                        err = _new_err()
+                        results = ODQueryCopyResults(query, False, byref(err))
+                        if not results:
+                            _raise_cf_error(err)
+                        try:
+                            if CFArrayGetCount(results) == 0:
+                                return id_value
+                        finally:
+                            CFRelease(results)
                     finally:
-                        CFRelease(results)
+                        CFRelease(query)
                 finally:
-                    CFRelease(query)
-            finally:
-                CFRelease(str_id)
-    finally:
-        CFRelease(empty_attrs)
-    raise DaemonUserError(f"Unable to find available {_pystr(attribute)} ID")
-
-
-def _create_record_with_unique_id(
-    node: int, name_cf: int, record_type: int, unique_id_attribute: int, id_range: tuple[int, int]
-) -> tuple[int, int]:
-    """Return (record, id) for `name_cf`, creating the record if needed.
-
-    If a record with this name already exists, its identifier attribute is
-    reused; if the record exists but lacks that attribute, a free id is assigned
-    to it. Otherwise a new record is created with the next free id in `id_range`.
-    The returned ODRecordRef is owned and must be released by the caller.
-    """
-    attr_to_fetch = _cfarray([kODAttributeTypeAllAttributes])
-    try:
-        while True:
-            err = _new_err()
-            record = ODNodeCopyRecord(node, record_type, name_cf, attr_to_fetch, byref(err))
-
-            if not record:
-                _release_error(err)  # discard the "not found" error; proceed to create
-                id_value = _get_available_id(node, record_type, unique_id_attribute, id_range)
-                str_id = _cfstr(str(id_value))
-                arr = _cfarray([str_id])
-                attrs = _cfdict([(unique_id_attribute, arr)])
-                try:
-                    err = _new_err()
-                    record = ODNodeCreateRecord(node, record_type, name_cf, attrs, byref(err))
-                    if not record:
-                        code, domain = _drain_error(err)
-                        if domain == _pystr(_kODErrorDomainFramework) and code == kODErrorRecordAlreadyExists:
-                            continue  # race: someone created it — retry the read
-                        raise RuntimeError(f"ODNodeCreateRecord failed (error {code})")
-                finally:
-                    CFRelease(attrs)
-                    CFRelease(arr)
                     CFRelease(str_id)
+        finally:
+            CFRelease(empty_attrs)
+        raise DaemonUserError(f"Unable to find available {_pystr(attribute)} ID")
+
+    def _create_record_with_unique_id(
+        node: int, name_cf: int, record_type: int, unique_id_attribute: int, id_range: tuple[int, int]
+    ) -> tuple[int, int]:
+        """Return (record, id) for `name_cf`, creating the record if needed.
+
+        If a record with this name already exists, its identifier attribute is
+        reused; if the record exists but lacks that attribute, a free id is
+        assigned to it. Otherwise a new record is created with the next free id
+        in `id_range`. The returned ODRecordRef is owned and must be released by
+        the caller.
+        """
+        attr_to_fetch = _cfarray([kODAttributeTypeAllAttributes])
+        try:
+            while True:
+                err = _new_err()
+                record = ODNodeCopyRecord(node, record_type, name_cf, attr_to_fetch, byref(err))
+
+                if not record:
+                    _release_error(err)  # discard the "not found" error; proceed to create
+                    id_value = _get_available_id(node, record_type, unique_id_attribute, id_range)
+                    str_id = _cfstr(str(id_value))
+                    arr = _cfarray([str_id])
+                    attrs = _cfdict([(unique_id_attribute, arr)])
+                    try:
+                        err = _new_err()
+                        record = ODNodeCreateRecord(node, record_type, name_cf, attrs, byref(err))
+                        if not record:
+                            code, domain = _drain_error(err)
+                            if domain == _pystr(_kODErrorDomainFramework) and code == kODErrorRecordAlreadyExists:
+                                continue  # race: someone created it — retry the read
+                            raise RuntimeError(f"ODNodeCreateRecord failed (error {code})")
+                    finally:
+                        CFRelease(attrs)
+                        CFRelease(arr)
+                        CFRelease(str_id)
+                    return record, id_value
+
+                # Record already exists.
+                maybe_id = _get_string_attribute(record, unique_id_attribute)
+                if maybe_id is not None:
+                    try:
+                        return record, int(maybe_id)
+                    except ValueError as exc:
+                        CFRelease(record)
+                        raise RuntimeError("Invalid identifier attribute value") from exc
+
+                id_value = _get_available_id(node, record_type, unique_id_attribute, id_range)
+                _set_attr_strings(record, unique_id_attribute, [str(id_value)])
+                _synchronize(record)
                 return record, id_value
+        finally:
+            CFRelease(attr_to_fetch)
 
-            # Record already exists.
-            maybe_id = _get_string_attribute(record, unique_id_attribute)
-            if maybe_id is not None:
+    def _create_daemon_user_darwin(
+        name: str, full_name: str, home_directory: str, shell: str | None
+    ) -> tuple[int, int]:
+        """Create the group + user via OpenDirectory and return (uid, gid)."""
+        shell = shell or "/usr/bin/false"  # macOS default: a locked shell
+        err = _new_err()
+        node = ODNodeCreateWithNodeType(None, kODSessionDefault, kODNodeTypeLocalNodes, byref(err))
+        if not node:
+            _raise_cf_error(err)
+
+        try:
+            cfname = _cfstr(name)
+            try:
+                group, gid = _create_record_with_unique_id(
+                    node, cfname, kODRecordTypeGroups, kODAttributeTypePrimaryGroupID, ID_RANGE
+                )
                 try:
-                    return record, int(maybe_id)
-                except ValueError as exc:
-                    CFRelease(record)
-                    raise RuntimeError("Invalid identifier attribute value") from exc
+                    user, uid = _create_record_with_unique_id(
+                        node, cfname, kODRecordTypeUsers, kODAttributeTypeUniqueID, ID_RANGE
+                    )
+                    try:
+                        is_hidden = _cfstr("dsAttrTypeNative:IsHidden")
+                        try:
+                            _set_attr_strings(user, kODAttributeTypePrimaryGroupID, [str(gid)])
+                            _set_attr_strings(user, kODAttributeTypeUserShell, [shell])
+                            _set_attr_strings(user, kODAttributeTypePassword, ["*"])  # login disabled
+                            _set_attr_strings(user, kODAttributeTypeNFSHomeDirectory, [home_directory])
+                            _set_attr_strings(user, is_hidden, ["1"])
+                            _set_attr_strings(user, kODAttributeTypeFullName, [full_name])
+                            _synchronize(user)
 
-            id_value = _get_available_id(node, record_type, unique_id_attribute, id_range)
-            _set_attr_strings(record, unique_id_attribute, [str(id_value)])
-            _synchronize(record)
-            return record, id_value
-    finally:
-        CFRelease(attr_to_fetch)
+                            _set_attr_strings(group, is_hidden, ["1"])
+                            _set_attr_strings(group, kODAttributeTypeFullName, [full_name])
+                            _synchronize(group)
+                        finally:
+                            CFRelease(is_hidden)
+                        return uid, gid
+                    finally:
+                        CFRelease(user)
+                finally:
+                    CFRelease(group)
+            finally:
+                CFRelease(cfname)
+        finally:
+            CFRelease(node)
+
+
+# --------------------------------------------------------------------------- #
+# Other platforms: user-management tools
+# --------------------------------------------------------------------------- #
+
+def _is_alpine() -> bool:
+    """Return True on Alpine Linux, which uses BusyBox adduser/addgroup."""
+    try:
+        contents = Path("/etc/os-release").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return any(line.strip() == "ID=alpine" for line in contents.splitlines())
+
+
+def _find_program(name: str, directories: tuple[str, ...]) -> str | None:
+    """Return the path to `name` within `directories`, or None if not found.
+
+    Only the given directories are searched; PATH is deliberately not consulted.
+    """
+    for directory in directories:
+        candidate = Path(directory) / name
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
+def _run(cmd: list[str]) -> None:
+    """Run a command, ignoring its exit status (success is verified afterwards)."""
+    subprocess.run(cmd, check=False, capture_output=True, text=True)
+
+
+def _create_daemon_user_via_commands(
+    name: str, full_name: str, home_directory: str, shell: str | None
+) -> tuple[int, int]:
+    """Create the account with the platform's user-management tools.
+
+    The tool is chosen by platform and by which programs are present (searched
+    only in fixed admin directories). A branch is taken only if its required
+    programs exist; otherwise the next candidate is tried, and if none apply the
+    platform is reported unsupported. These tools create locked, no-login
+    accounts by default. The assigned ids are read back with getpwnam.
+    """
+    system = platform.system()
+    useradd = _find_program("useradd", ("/usr/sbin", "/bin"))
+    groupadd = _find_program("groupadd", ("/usr/sbin", "/bin"))
+    pw = _find_program("pw", ("/usr/sbin",))
+    alpine = _is_alpine()
+    adduser = _find_program("adduser", ("/usr/sbin",)) if alpine else None
+    addgroup = _find_program("addgroup", ("/usr/sbin",)) if alpine else None
+
+    if system == "Linux" and useradd:
+        _run([useradd, "-r", "-d", home_directory, "-s", shell or "/bin/false", "-c", full_name, name])
+    elif system == "Linux" and alpine and adduser and addgroup:
+        _run([addgroup, "-S", name])
+        _run([adduser, "-S", "-D", "-H", "-h", home_directory, "-s", shell or "/sbin/nologin", "-g", full_name, name])
+        # A second addgroup puts the user in its group; adduser's -G is unreliable here.
+        _run([addgroup, name, name])
+    elif system in ("OpenBSD", "NetBSD") and useradd:
+        _run([useradd, "-L", "daemon", "-g", "=uid", "-d", home_directory, "-s", shell or "/sbin/nologin", "-c", full_name, name])
+    elif system == "Haiku" and useradd and groupadd:
+        _run([groupadd, name])
+        _run([useradd, "-g", name, "-d", home_directory, "-s", shell or "/bin/false", "-n", full_name, name])
+    elif system in ("FreeBSD", "DragonFly") and pw:
+        _run([pw, "adduser", name, "-d", home_directory, "-s", shell or "/usr/sbin/nologin", "-c", full_name])
+    elif system == "SunOS" and useradd and groupadd:
+        _run([groupadd, name])
+        _run([useradd, "-g", name, "-d", home_directory, "-s", shell or "/bin/false", "-c", full_name, name])
+    else:
+        raise DaemonUserError(f"unsupported platform or required tools not found ({system})")
+
+    try:
+        entry = pwd.getpwnam(name)
+    except KeyError:
+        raise DaemonUserError(f"account {name!r} was not created") from None
+    return entry.pw_uid, entry.pw_gid
 
 
 # --------------------------------------------------------------------------- #
@@ -449,65 +558,28 @@ def create_daemon_user(
     name: str,
     full_name: str,
     home_directory: str,
-    shell: str = DEFAULT_SHELL,
-    password: str = DEFAULT_PASSWORD,
+    shell: str | None = None,
 ) -> tuple[int, int]:
     """Create the hidden daemon group + user and return (uid, gid).
 
-    `full_name` is applied to both the user and the group. `home_directory` and
-    `full_name` are mandatory; `shell` and `password` fall back to a disabled
-    login shell and a disabled password.
+    `full_name` is applied to both the user and the group; `full_name` and
+    `home_directory` are mandatory. When `shell` is None a platform-appropriate
+    locked shell is used. The account is always created with login disabled.
 
     The caller is responsible for ensuring the process is root and that no user
-    or group already claims `name` (see main()); this function performs the OD
-    writes and will surface a lower-level error if those preconditions fail.
+    or group already claims `name` (see main()); this function performs the
+    account creation and will surface a lower-level error if those preconditions
+    fail.
     """
-    err = _new_err()
-    node = ODNodeCreateWithNodeType(None, kODSessionDefault, kODNodeTypeLocalNodes, byref(err))
-    if not node:
-        _raise_cf_error(err)
-
-    try:
-        cfname = _cfstr(name)
-        try:
-            group, gid = _create_record_with_unique_id(
-                node, cfname, kODRecordTypeGroups, kODAttributeTypePrimaryGroupID, ID_RANGE
-            )
-            try:
-                user, uid = _create_record_with_unique_id(
-                    node, cfname, kODRecordTypeUsers, kODAttributeTypeUniqueID, ID_RANGE
-                )
-                try:
-                    is_hidden = _cfstr("dsAttrTypeNative:IsHidden")
-                    try:
-                        _set_attr_strings(user, kODAttributeTypePrimaryGroupID, [str(gid)])
-                        _set_attr_strings(user, kODAttributeTypeUserShell, [shell])
-                        _set_attr_strings(user, kODAttributeTypePassword, [password])
-                        _set_attr_strings(user, kODAttributeTypeNFSHomeDirectory, [home_directory])
-                        _set_attr_strings(user, is_hidden, ["1"])
-                        _set_attr_strings(user, kODAttributeTypeFullName, [full_name])
-                        _synchronize(user)
-
-                        _set_attr_strings(group, is_hidden, ["1"])
-                        _set_attr_strings(group, kODAttributeTypeFullName, [full_name])
-                        _synchronize(group)
-                    finally:
-                        CFRelease(is_hidden)
-                    return uid, gid
-                finally:
-                    CFRelease(user)
-            finally:
-                CFRelease(group)
-        finally:
-            CFRelease(cfname)
-    finally:
-        CFRelease(node)
+    if sys.platform == "darwin":
+        return _create_daemon_user_darwin(name, full_name, home_directory, shell)
+    return _create_daemon_user_via_commands(name, full_name, home_directory, shell)
 
 
 def main(argv: list[str] | None = None) -> int:
     """main entry point"""
     parser = argparse.ArgumentParser(
-        description="Create a hidden macOS daemon user and a matching group.",
+        description="Create a hidden daemon user and a matching group.",
     )
     parser.add_argument("login", help="record name for both the user and the group")
     parser.add_argument(
@@ -516,21 +588,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "-d", "--home-dir", dest="home_directory", required=True,
-        help="home directory (NFSHomeDirectory)",
+        help="home directory for the account",
     )
     parser.add_argument(
-        "-s", "--shell", default=DEFAULT_SHELL,
-        help="login shell (default: %(default)s)",
-    )
-    parser.add_argument(
-        "-p", "--password", default=DEFAULT_PASSWORD,
-        help='password attribute (default: %(default)r, which disables login)',
+        "-s", "--shell", default=None,
+        help="login shell (default: a platform-appropriate locked shell)",
     )
     args = parser.parse_args(argv)
 
     try:
         if os.geteuid() != 0:
-            raise DaemonUserError("must be run as root (writes to the local directory node)")
+            raise DaemonUserError("must be run as root (creates a local account)")
         existing = _existing_kind(args.login)
         if existing:
             raise DaemonUserError(f"a {existing} named {args.login!r} already exists")
@@ -539,7 +607,6 @@ def main(argv: list[str] | None = None) -> int:
             full_name=args.full_name,
             home_directory=args.home_directory,
             shell=args.shell,
-            password=args.password,
         )
     except DaemonUserError as exc:
         print(f"{parser.prog}: error: {exc}", file=sys.stderr)
