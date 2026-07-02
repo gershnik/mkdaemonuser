@@ -1,0 +1,24 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The tests create and delete real accounts, so they must run as root.
+      # sudo resets PATH to a secure default (which on macOS can point at an
+      # older /usr/bin/python3), so pass the resolved interpreter explicitly.
+      - name: Run tests
+        run: sudo "$(which python3)" test/test.py

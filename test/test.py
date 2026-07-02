@@ -1,5 +1,8 @@
 #! /usr/bin/env python3
 
+# Copyright (c) 2026, Eugene Gershnik
+# SPDX-License-Identifier: BSD-3-Clause
+
 """Standalone tests for mkdaemonuser (not pytest).
 
 Creates real daemon accounts with invented, collision-unlikely names, verifies

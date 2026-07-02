@@ -1,5 +1,8 @@
 #! /usr/bin/env python3
 
+# Copyright (c) 2026, Eugene Gershnik
+# SPDX-License-Identifier: BSD-3-Clause
+
 """Create a "daemon" user + group.
 
 On macOS the account is created through the OpenDirectory C API (via ctypes,
