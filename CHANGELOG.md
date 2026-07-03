@@ -5,6 +5,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## Unreleased
 
+## [1.0] - 2026-07-02
+
 ### Added
 - Initial version
 
+[1.0]: https://github.com/gershnik/mkdaemonuser/releases/v1.0
